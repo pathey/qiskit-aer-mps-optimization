@@ -752,16 +752,37 @@ rvector_t State::measure_probs(const reg_t &qubits) const {
 
 std::vector<SampleVector> State::sample_measure(const reg_t &qubits,
                                                 uint_t shots, RngEngine &rng) {
-  // There are two alternative algorithms for sample measure
-  // We choose the one that is optimal relative to the total number
-  // of qubits,and the number of shots.
-  // The parameters used below are based on experimentation.
-  // The user can override this by setting the parameter
-  // "mps_sample_measure_algorithm"
+  // There are two alternative algorithms for sample measure.
+  // For full-register measurement, keep the existing fast path.
   if (MPS::get_sample_measure_alg() == Sample_measure_alg::PROB &&
       qubits.size() == qreg_.num_qubits()) {
     return sample_measure_all(shots, rng);
   }
+
+  // Minimum optimization:
+  // For subset measurement in PROB mode, compute the marginal probability
+  // distribution once, then sample from it for each shot.
+  if (MPS::get_sample_measure_alg() == Sample_measure_alg::PROB) {
+    std::vector<SampleVector> all_samples(shots);
+
+    rvector_t probs = measure_probs(qubits);
+
+#pragma omp parallel for if (BaseState::threads_ > 1)
+    for (int_t i = 0; i < static_cast<int_t>(shots); i++) {
+      uint_t outcome = rng.rand_int(probs);
+
+      reg_t outcome_vec(qubits.size(), 0);
+      for (uint_t j = 0; j < qubits.size(); ++j) {
+        outcome_vec[j] = (outcome >> j) & 1U;
+      }
+
+      all_samples[i].from_vector(outcome_vec);
+    }
+
+    return all_samples;
+  }
+
+  // Fallback: copy-and-measure path
   return sample_measure_using_apply_measure(qubits, shots, rng);
 }
 
