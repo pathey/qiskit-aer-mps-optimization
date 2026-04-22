@@ -738,8 +738,20 @@ void State::apply_measure(const reg_t &qubits, const reg_t &cmemory,
                           const reg_t &cregister, RngEngine &rng) {
   rvector_t rands;
   rands.reserve(qubits.size());
-  for (uint_t i = 0; i < qubits.size(); ++i)
+  for (uint_t i = 0; i < qubits.size(); ++i) {
     rands.push_back(rng.rand(0., 1.));
+  }
+
+  // Use the subset conditional sampler from the paper, then collapse onto the
+  // chosen outcome using the deterministic collapse path you already added.
+  if (MPS::get_sample_measure_alg() == Sample_measure_alg::PROB &&
+      qubits.size() < qreg_.num_qubits()) {
+    reg_t outcome = qreg_.sample_measure_subset(qubits, rands);
+    reg_t stored_outcome = qreg_.apply_measure_outcome(qubits, outcome);
+    creg().store_measure(stored_outcome, cmemory, cregister);
+    return;
+  }
+
   reg_t outcome = qreg_.apply_measure(qubits, rands);
   creg().store_measure(outcome, cmemory, cregister);
 }
@@ -752,37 +764,40 @@ rvector_t State::measure_probs(const reg_t &qubits) const {
 
 std::vector<SampleVector> State::sample_measure(const reg_t &qubits,
                                                 uint_t shots, RngEngine &rng) {
-  // There are two alternative algorithms for sample measure.
-  // For full-register measurement, keep the existing fast path.
+  // Keep the existing full-register fast path.
   if (MPS::get_sample_measure_alg() == Sample_measure_alg::PROB &&
       qubits.size() == qreg_.num_qubits()) {
     return sample_measure_all(shots, rng);
   }
 
-  // Minimum optimization:
-  // For subset measurement in PROB mode, compute the marginal probability
-  // distribution once, then sample from it for each shot.
+  // Proper Isermann-style subset sampling:
+  // sample conditionally from the MPS without copying/collapsing it per shot.
   if (MPS::get_sample_measure_alg() == Sample_measure_alg::PROB) {
     std::vector<SampleVector> all_samples(shots);
+    std::vector<rvector_t> rnds_list;
+    rnds_list.reserve(shots);
 
-    rvector_t probs = measure_probs(qubits);
-
-#pragma omp parallel for if (BaseState::threads_ > 1)
-    for (int_t i = 0; i < static_cast<int_t>(shots); i++) {
-      uint_t outcome = rng.rand_int(probs);
-
-      reg_t outcome_vec(qubits.size(), 0);
+    for (uint_t i = 0; i < shots; ++i) {
+      rvector_t rands;
+      rands.reserve(qubits.size());
       for (uint_t j = 0; j < qubits.size(); ++j) {
-        outcome_vec[j] = (outcome >> j) & 1U;
+        rands.push_back(rng.rand(0., 1.));
       }
+      rnds_list.push_back(std::move(rands));
+    }
 
-      all_samples[i].from_vector(outcome_vec);
+#pragma omp parallel if (BaseState::threads_ > 1) num_threads(BaseState::threads_)
+    {
+#pragma omp for
+      for (int_t i = 0; i < static_cast<int_t>(shots); i++) {
+        auto single_result = qreg_.sample_measure_subset(qubits, rnds_list[i]);
+        all_samples[i].from_vector(single_result);
+      }
     }
 
     return all_samples;
   }
 
-  // Fallback: copy-and-measure path
   return sample_measure_using_apply_measure(qubits, shots, rng);
 }
 
